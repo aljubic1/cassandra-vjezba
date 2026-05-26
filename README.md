@@ -1,4 +1,4 @@
-# Laboratorijska vježba — Apache Cassandra
+# Vježba — Apache Cassandra
 
 Ovaj projekt sadrži rješenja za vježbu iz NoSQL baze podataka Apache Cassandra. Sustav je podignut lokalno unutar Docker okruženja.
 
