@@ -1,0 +1,504 @@
+CMD
+mkdir cassandra-vjezba
+cd cassandra-vjezba
+code .
+mkdir screenshots
+
+
+Visual studio
+docker-compose.yml:
+
+services:
+  cassandra:
+    image: cassandra:5
+    ports:
+      - "9042:9042"   # CQL native transport (cqlsh i driveri)
+    environment:
+      CASSANDRA_CLUSTER_NAME: VjezbaCluster
+      CASSANDRA_DC: dc1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    volumes:
+      - cass_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+volumes:
+  cass_data:
+
+Terminal
+docker compose up -d
+docker compose ps
+# Pričekaj ~30 sekundi da se Cassandra inicijalizira
+# Provjeri log - čekaj poruku:
+# "Starting listening for CQL clients"
+docker compose logs cassandra -f
+
+
+docker ps --format '{{.Names}}'
+docker exec -it cassandra-vjezba-cassandra-1 cqlsh
+u cqlsh konzoli izvršiti: SELECT now() FROM system.local; — potvrditi da query vraća UUID timestamp
+
+
+Korak 2
+CREATE KEYSPACE IF NOT EXISTS vjezba
+  WITH replication = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 1
+  };
+
+USE vjezba;
+
+
+Kreiranje tablice narudžbi (dizajnirane za query po korisniku):
+CREATE TABLE narudzbe (
+  korisnik_id UUID,
+  created_at  TIMESTAMP,
+  narudzba_id UUID,
+  ukupno      DECIMAL,
+  status      TEXT,
+  grad        TEXT,
+  PRIMARY KEY (korisnik_id, created_at)
+) WITH CLUSTERING ORDER BY (created_at DESC);
+Objašnjenje: korisnik_id je partition key — sve narudžbe istog korisnika nalaze se na istom čvoru. created_at je clustering column — narudžbe su sortirane po datumu unutar particije, od najnovije. Ovo čini query 'zadnjih N narudžbi korisnika X' izuzetno brzim.
+Kreiranje tablice proizvoda:
+CREATE TABLE proizvodi (
+  id          UUID PRIMARY KEY,
+  naziv       TEXT,
+  cijena      DECIMAL,
+  kategorija  TEXT,
+  dostupnost  BOOLEAN
+);
+Kreiranje tablice recenzija (dizajnirane za query po proizvodu):
+CREATE TABLE recenzije (
+  proizvod_id UUID,
+  korisnik_id UUID,
+  ocjena      INT,
+  komentar    TEXT,
+  created_at  TIMESTAMP,
+  PRIMARY KEY (proizvod_id, korisnik_id)
+);
+Za provjeru kreiranih tablica:
+DESCRIBE TABLES;
+DESCRIBE TABLE narudzbe;
+
+□	izvršiti sve CREATE naredbe iz Koraka 2 i potvrditi da DESCRIBE TABLES; prikazuje tri tablice
+
+
+□	kreirati dodatnu tablicu po vlastitom izboru koja ima smisleni composite primary key (npr. tablica za praćenje pregleda proizvoda po korisniku i datumu)
+
+CREATE TABLE pregledi_proizvoda (
+  korisnik_id      UUID,
+  vrijeme_pregleda TIMESTAMP,
+  proizvod_id      UUID,
+  trajanje_sekundi INT,
+  PRIMARY KEY (korisnik_id, vrijeme_pregleda)
+) WITH CLUSTERING ORDER BY (vrijeme_pregleda DESC);
+
+Objasnjenj:PRIMARY KEY (korisnik_id, vrijeme_pregleda) čini ovaj ključ kompozitnim jer se sastoji od dva stupca.
+
+Omogućuje nam da u stvarnom vremenu ekstremno brzo izvučemo povijest svih proizvoda koje je neki specifični korisnik gledao, i to poslagane točno po kronološkom redu (zahvaljujući CLUSTERING ORDER BY).
+
+
+
+Korak 3 — Unos podataka: INSERT i UPSERT semantika
+INSERT u Cassandri ima upsert semantiku — ako insertirate red s istim primary key-em, novi zapis prepiše stari po timestamp-u. Nema poruke o grešci ni potvrde o duplikatu. Ovo je svjesni dizajnerski izbor koji omogućuje visoku propusnost pisanja u distribuiranom okruženju.
+Unos proizvoda:
+INSERT INTO proizvodi (id, naziv, cijena, kategorija, dostupnost)
+VALUES (uuid(), 'Laptop Pro 15', 1299.99, 'elektronika', true);
+
+INSERT INTO proizvodi (id, naziv, cijena, kategorija, dostupnost)
+VALUES (uuid(), 'Bežične slušalice', 149.99, 'elektronika', true);
+
+INSERT INTO proizvodi (id, naziv, cijena, kategorija, dostupnost)
+VALUES (uuid(), 'Ergonomska stolica', 349.00, 'namještaj', true);
+
+INSERT INTO proizvodi (id, naziv, cijena, kategorija, dostupnost)
+VALUES (uuid(), 'Mehanička tipkovnica', 89.99, 'elektronika', false);
+
+INSERT INTO proizvodi (id, naziv, cijena, kategorija, dostupnost)
+VALUES (uuid(), 'Monitor 27"', 499.00, 'elektronika', true);
+
+INSERT INTO proizvodi (id, naziv, cijena, kategorija, dostupnost)
+VALUES (uuid(), 'Radni stol', 279.00, 'namještaj', true);
+Napomena: uuid() je CQL funkcija koja generira novi UUID. Kopirajte nekoliko UUID vrijednosti iz rezultata SELECT * FROM proizvodi; — trebat će vam za INSERT narudžbi i recenzija.
+Unos narudžbi (koristite UUID-ove korisnika koje sami definirate):
+-- Definirajte UUID-ove za korisnike (koristite iste za više narudžbi)
+-- Primjer: zamijenite s UUID-ovima koje sami generirate pomoću uuid()
+
+-- Narudžbe korisnika A (3 narudžbe)
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad)
+VALUES (11111111-1111-1111-1111-111111111111,
+        toTimestamp(now()), uuid(), 1449.98, 'isporuceno', 'Zagreb');
+
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad)
+VALUES (11111111-1111-1111-1111-111111111111,
+        toTimestamp(now()), uuid(), 349.00, 'u_obradi', 'Zagreb');
+
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad)
+VALUES (11111111-1111-1111-1111-111111111111,
+        toTimestamp(now()), uuid(), 89.99, 'isporuceno', 'Zagreb');
+
+-- Narudžbe korisnika B (2 narudžbe)
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad)
+VALUES (22222222-2222-2222-2222-222222222222,
+        toTimestamp(now()), uuid(), 499.00, 'isporuceno', 'Split');
+
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad)
+VALUES (22222222-2222-2222-2222-222222222222,
+        toTimestamp(now()), uuid(), 279.00, 'otkazano', 'Split');
+Unos recenzija (koristite UUID-ove proizvoda iz SELECT * FROM proizvodi;):
+1. Prva recenzija (Korisnik A za Laptop)
+SQL
+INSERT INTO recenzije (proizvod_id, korisnik_id, ocjena, komentar, created_at) VALUES (ccd3a17c-a63f-4dff-aa46-7c4dafe278cd, 11111111-1111-1111-1111-111111111111, 5, 'Odlican laptop, brz i tih.', toTimestamp(now()));
+2. Druga recenzija (Korisnik B za Laptop)
+SQL
+INSERT INTO recenzije (proizvod_id, korisnik_id, ocjena, komentar, created_at) VALUES (ccd3a17c-a63f-4dff-aa46-7c4dafe278cd, 22222222-2222-2222-2222-222222222222, 4, 'Dobra kupnja, baterija mogla bolja.', toTimestamp(now()));
+3. Treća recenzija (Korisnik A za Stolicu)
+SQL
+INSERT INTO recenzije (proizvod_id, korisnik_id, ocjena, komentar, created_at) VALUES (ab309fd9-9c7e-4e30-8c86-73b77f7764e7, 11111111-1111-1111-1111-111111111111, 5, 'Spasila mi je leda!', toTimestamp(now()));
+Provjera nakon unosa:
+SELECT * FROM recenzije;
+Za provjeru unesenih podataka:
+SELECT * FROM proizvodi;
+SELECT * FROM narudzbe;
+SELECT COUNT(*) FROM narudzbe;
+
+
+□	dodati minimalno 3 vlastite narudžbe za trećeg korisnika (korisnik_id po vlastitom izboru, različiti gradovi)
+
+
+1. Korak: Unos 3 nove narudžbe za trećeg korisnika
+Prva narudžba (Mostar - s točno fiksiranim vremenom 12:00:00):
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad) VALUES (33333333-3333-3333-3333-333333333333, '2026-05-25 12:00:00+0000', uuid(), 150.00, 'u_obradi', 'Mostar');
+
+Druga narudžba (Sarajevo - trenutno vrijeme):
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad) VALUES (33333333-3333-3333-3333-333333333333, toTimestamp(now()), uuid(), 45.50, 'isporuceno', 'Sarajevo');
+
+
+Treća narudžba (Banja Luka - trenutno vrijeme):
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad) VALUES (33333333-3333-3333-3333-333333333333, toTimestamp(now()), uuid(), 620.00, 'isporuceno', 'Banja Luka');
+
+
+2. Korak: Pokretanje UPSERT-a (Dokaz za profesora)
+Sada unosiš narudžbu koja ima potpuno isti primarni ključ kao ova prva narudžba za Mostar (isti ID korisnika i isto vrijeme 12:00:00), ali mijenjamo iznos na 999.99. Cassandra neće javiti grešku, nego će tiho ažurirati taj redak!
+
+
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad) VALUES (33333333-3333-3333-3333-333333333333, '2026-05-25 12:00:00+0000', uuid(), 999.99, 'u_obradi', 'Mostar');
+
+3. Korak: Provjera i slikanje za Zadatak 3 📸
+Sada upiši ovu naredbu da vidiš samo narudžbe tog novog korisnika:
+
+SELECT * FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333;
+Baza će ti ispisati točno 3 retka (jer je četvrti prebrisao prvi), a iznos za Mostar će biti 999.99.
+
+SELECT * FROM narudzbe;
+
+
+□	testirati UPSERT semantiku: insertirajte red s istim korisnik_id i created_at, ali s drugačijim ukupno iznosom — provjeri koji iznos ostaje u bazi i u screenshots/ spremi rezultat
+Iako tvoja tablica već ima 8 redova, profesor u uputama izričito traži da mu kroz terminal dokažeš kako radi UPSERT (da Cassandra prepisuje stari podatak novim ako im se poklapaju ključevi) i da tu sliku spremiš posebno u mapu screenshots/.
+
+Idemo to riješiti u dva brza koraka da točno vidiš kako to radi na tvom ekranu:
+
+Korak 1: Unos upita za UPSERT test
+Pogledajmo tvoju sliku: ti već imaš narudžbu za Mostar gdje je vrijeme točno 2026-05-25 12:00:00.000000+0000 i iznos 999.99.
+
+Sada ćemo unijeti novu narudžbu s identičnim korisnikom i vremenom, ali ćemo iznos promijeniti na 888.88. Kopiraj ovu naredbu, zalijepi je u terminal i stisni Enter:
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad) VALUES (33333333-3333-3333-3333-333333333333, '2026-05-25 12:00:00+0000', uuid(), 888.88, 'u_obradi', 'Mostar');
+
+Korak 2: Provjera i slikanje dokaza za profesora 📸
+Sada upiši ovu naredbu da vidimo što je ostalo u bazi:
+SELECT * FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333;
+Što će se dogoditi?
+Vidjet ćeš da iznos 999.99 za Mostar više ne postoji. Umjesto njega sada piše 888.88. Broj redova u bazi je ostao isti (nije se dodao novi red), što je čisti dokaz da je Cassandra napravila Update postojećeg retka!
+
+
+
+Korak4
+Sve narudžbe određenog korisnika (efikasan query — partition key u WHERE):
+SELECT korisnik_id, created_at, ukupno, status
+FROM narudzbe
+WHERE korisnik_id = 11111111-1111-1111-1111-111111111111;
+Narudžbe korisnika od određenog datuma (clustering column range query):
+SELECT * FROM narudzbe
+WHERE korisnik_id = 11111111-1111-1111-1111-111111111111
+  AND created_at >= '2024-01-01 00:00:00+0000';
+Paginacija — dohvat prvih N narudžbi:
+SELECT * FROM narudzbe
+WHERE korisnik_id = 11111111-1111-1111-1111-111111111111
+LIMIT 2;
+Svi proizvodi u bazi (bez WHERE — prihvatljivo za male skupove):
+SELECT naziv, cijena, kategorija, dostupnost
+FROM proizvodi;
+ALLOW FILTERING — za razvoj i debug (ne koristiti u produkciji):
+-- Filtriranje po non-partition key stupcu zahtijeva ALLOW FILTERING
+SELECT naziv, cijena FROM proizvodi
+WHERE kategorija = 'elektronika'
+ALLOW FILTERING;
+
+-- Ekvivalentno za dostupne proizvode
+SELECT naziv, cijena FROM proizvodi
+WHERE dostupnost = true
+ALLOW FILTERING;
+Upozorenje: ALLOW FILTERING radi full table scan — kontaktira sve čvorove i skenira sve particije. U produkciji s velikom tablicom može zagušiti klaster. Efikasno rješenje je Secondary Index ili Materialized View (vidi Korak 6).
+Provjera TTL-a (time-to-live) na zapisu:
+-- Umetni zapis koji automatski nestaje za 60 sekundi
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad)
+VALUES (33333333-3333-3333-3333-333333333333,
+        toTimestamp(now()), uuid(), 9.99, 'test', 'Mostar')
+USING TTL 60;
+
+-- Provjeri preostali TTL
+SELECT TTL(status), TTL(ukupno), status, grad
+FROM narudzbe
+WHERE korisnik_id = 33333333-3333-3333-3333-333333333333;
+
+-- Nakon 60 sekundi zapis nestaje automatski
+
+
+
+□	pronaći sve narudžbe trećeg korisnika kojeg ste sami dodali u Zadatku 3, sortirane od najstarije (promijenite CLUSTERING ORDER)
+
+SELECT korisnik_id, created_at, narudzba_id, ukupno, status, grad FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333 ORDER BY created_at ASC;
+Zašto smo dodali ORDER BY created_at ASC?
+Prilikom kreiranja tablice narudzbe u Zadatku 2, definirali smo zadani redoslijed razvrstavanja (CLUSTERING ORDER BY) kao created_at DESC, što znači da baza podatke automatski vraća od najnovijih prema najstarijima.
+
+Budući da profesor u ovom podzadatku traži obrnuto – od najstarije narudžbe – eksplicitno mijenjamo taj redoslijed pomoću ključne riječi ASC (uzlazno).
+
+Javi mi jesi li dobila ispis u terminalu pa idemo odmah na idući kvadratić: upit sa STATUS = 'isporuceno' i hvatanje screenshota!
+
+
+□	pronaći sve narudžbe sa statusom 'isporuceno' koristeći ALLOW FILTERING — napraviti screenshot i u ODGOVORI.md objasniti zašto je ovaj query problematičan u produkciji (2–3 rečenice
+Zadatak 4.2: Filtriranje po statusu 'isporuceno' + ALLOW FILTERING
+Sada tražimo sve narudžbe u bazi koje imaju status 'isporuceno'. Budući da status nije dio primarnog ključa (baza nije indeksirana po njemu), Cassandra će nam odbiti izvršiti upit osim ako joj izričito ne dopustimo skeniranje pomoću ALLOW FILTERING.
+
+Kopiraj ovu naredbu, zalijepi je u terminal i stisni Enter:
+SELECT * FROM narudzbe WHERE status = 'isporuceno' ALLOW FILTERING;
+
+
+□	testirati TTL: umetnuti narudžbu s TTL=30 sekundi, odmah provjeriti TTL(status), pričekati 35 sekundi i potvrditi da zapis ne postoji
+
+Profesor želi da testiraš kako u Cassandri radi TTL (Time-To-Live), odnosno privremeni zapisi koji se sami obrišu nakon određenog broja sekundi. Ovaj put radimo test na 30 sekundi i provjeravamo kako nestaje iz baze.
+
+Idemo to izvesti kroz 3 brza koraka u terminalu:
+
+Korak 1: Ubaci privremenu narudžbu s TTL=30
+Kopiraj ovu naredbu, zalijepi je u terminal i stisni Enter:
+
+INSERT INTO narudzbe (korisnik_id, created_at, narudzba_id, ukupno, status, grad) VALUES (33333333-3333-3333-3333-333333333333, toTimestamp(now()), uuid(), 19.99, 'ttl_30_sekundi', 'Mostar') USING TTL 30;
+
+Korak 2: Odmah provjeri preostale sekunde (Pokreni ODMAH!)
+Brzo kopiraj ovu naredbu, zalijepi je i stisni Enter:
+SELECT TTL(status), status, grad FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333;
+
+U tablici ćeš u jednom redu vidjeti status ttl_30_sekundi, a u prvoj koloni će pisati točan broj sekundi koliko mu je preostalo života (npr. 24 ili 18).
+
+Korak 3: Pričekaj 35 sekundi pa provjeri opet
+Sada lagano pričekaj oko pola minute da vrijeme iscuri, pa ponovno pokreni istu tu naredbu iz Koraka 2:
+SELECT TTL(status), status, grad FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333;
+Što se dogodilo?
+Redak koji je imao status ttl_30_sekundi je potpuno nestao! U tablici su ti ostale samo tvoje standardne, trajne narudžbe za tog korisnika. Cassandra ga je sama obrisala s diska čim je brojač došao do nule.
+
+
+Korak 5 — UPDATE, DELETE i Lightweight Transactions
+-- Ažuriranje statusa narudžbe (mora specificirati puni primary key)
+UPDATE narudzbe SET status = 'isporuceno' WHERE korisnik_id = 22222222-2222-2222-2222-222222222222 AND created_at = '2026-05-25 06:47:49.365000+0000';
+
+Ažuriranje više polja odjednom (Mijenjamo grad u Rijeka i status natrag u u_obradi)
+UPDATE narudzbe SET status = 'u_obradi', grad = 'Rijeka' WHERE korisnik_id = 22222222-2222-2222-2222-222222222222 AND created_at = '2026-05-25 06:47:49.365000+0000';
+
+Provjera:
+SELECT * FROM narudzbe WHERE korisnik_id = 22222222-2222-2222-2222-222222222222;
+
+
+Brisanje jedne narudžbe
+Ova naredba služi kao demonstracija brisanja po punom primarnom ključu. Iskoristit ćemo tvoju narudžbu za Mostar i obrisati je (to ujedno rješava i tvoj službeni zadatak/kvadratić za brisanje narudžbe!).
+DELETE FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333 AND created_at = '2026-05-25 12:00:00.000000+0000';
+
+Brisanje samo jednog stupca (ćelije)
+U Cassandri možeš obrisati samo jednu specifičnu vrijednost (npr. komentar), a da ostatak retka (ocjena, ID-evi) ostane u bazi. Iskoristit ćemo recenziju koju je Korisnik A ostavio za Laptop (ccd3a17c...).
+DELETE komentar FROM recenzije WHERE proizvod_id = ccd3a17c-a63f-4dff-aa46-7c4dafe278cd AND korisnik_id = 11111111-1111-1111-1111-111111111111;
+
+Provjera:
+SELECT * FROM recenzije WHERE proizvod_id = ccd3a17c-a63f-4dff-aa46-7c4dafe278cd AND korisnik_id = 11111111-1111-1111-1111-111111111111;
+
+
+
+
+INSERT IF NOT EXISTS (Uspješan unos)
+Ova naredba stvara potpuno novi proizvod s novim generiranim UUID-om, pa će sigurno uspjeti jer taj ID još ne postoji u bazi.
+INSERT INTO proizvodi (id, naziv, cijena, kategorija, dostupnost) VALUES (uuid(), 'Novi proizvod', 49.99, 'ostalo', true) IF NOT EXISTS;
+
+
+UPDATE ... IF status = 'u_obradi'
+Sada ćemo testirati uvjetni UPDATE na Korisniku A (11111111...) za njegovu narudžbu iz Zagreba. Iskoristit ćemo onu njegovu prvu narudžbu koja ima timestamp 2026-05-25 06:46:39.799000+0000.
+UPDATE narudzbe SET status = 'isporuceno' WHERE korisnik_id = 11111111-1111-1111-1111-111111111111 AND created_at = '2026-05-25 06:46:39.799000+0000' IF status = 'u_obradi';
+
+Budući da je toj narudžbi trenutni status već bio isporuceno (od ranijih upita), ovaj uvjet IF status = 'u_obradi' neće biti ispunjen.
+Zato će ti Cassandra u terminalu ispisati [applied] | false i pokazati ti trenutno stanje u bazi.
+
+Ovdje profesor objašnjava kako radi Logged BATCH u Cassandri. Njegova svrha je da spoji više naredbi (u ovom slučaju INSERT i UPDATE) u jedan paket koji se izvršava atomično – ili će proći obje naredbe odjednom, ili neće proći nijedna.
+
+Da bismo ovaj primjer izvrtjeli točno kako piše u skripti, iskoristit ćemo ID našeg Monitora (ccd3a17c-a63f-4dff-aa46-7c4dafe278cd) koji već imamo u bazi.
+
+BEGIN BATCH
+ INSERT INTO recenzije (proizvod_id, korisnik_id, ocjena, komentar, created_at) VALUES (ccd3a17c-a63f-4dff-aa46-7c4dafe278cd, 22222222-2222-2222-2222-222222222222, 5, 'Odlicna rezolucija.', toTimestamp(now()));
+ UPDATE recenzije SET ocjena = 5 WHERE proizvod_id = ccd3a17c-a63f-4dff-aa46-7c4dafe278cd AND korisnik_id = 22222222-2222-2222-2222-222222222222;
+APPLY BATCH;
+
+
+□	ažurirati status jedne vlastite narudžbe iz 'u_obradi' u 'isporuceno' koristeći UPDATE — potvrditi promjenu SELECT upitom
+UPDATE narudzbe SET status = 'isporuceno' WHERE korisnik_id = 33333333-3333-3333-3333-333333333333 AND created_at = '2026-05-25 12:00:00.000000+0000';
+
+
+Potvrdi promjenu pomoću SELECT upita
+Sada odmah pokreni ovaj upit kako bismo provjerili je li Cassandra uspješno prepisala status na disku:
+
+SELECT korisnik_id, created_at, status, grad FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333;
+
+
+□	testirati LWT: pokušati INSERT IF NOT EXISTS s UUID-om koji već postoji u tablici proizvodi — napraviti screenshot [applied] = false rezultata
+
+Uzmimo ID Monitora (ccd3a17c...) koji sigurno već imaš u bazi od ranije. Kopiraj ovu naredbu, zalijepi je u terminal i stisni Enter:
+INSERT INTO proizvodi (id, naziv, cijena, kategorija, dostupnost) VALUES (ccd3a17c-a63f-4dff-aa46-7c4dafe278cd, 'Lazni Monitor', 99.99, 'elektronika', true) IF NOT EXISTS;
+
+
+□	obrisati jednu narudžbu DELETE-om i potvrditi da zapis više ne postoji
+Obrisat ćemo upravo onu narudžbu za Mostar (12:00:00) kako bismo pokazali profesoru da DELETE radi ispravno.
+
+1. Korak: Pokreni brisanje u terminalu
+Kopiraj ovu naredbu, zalijepi je u terminal i stisni Enter:
+DELETE FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333 AND created_at = '2026-05-25 12:00:00.000000+0000';
+
+2. Korak: Potvrdi da zapis više ne postoji
+Sada pokreni ovaj SELECT da provjerimo stanje:
+SELECT korisnik_id, created_at, status, grad FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333;
+
+U terminalu će ti umjesto dosadašnja 3 retka ispisati samo (2 rows) – narudžba za Sarajevo i Banja Luka. Mostar je uspješno obrisan!
+
+
+Stigli smo na Korak 6 — Secondary Index i Materialized View
+
+-- Kreiraj index na kategorija stupcu
+CREATE INDEX idx_kategorija ON proizvodi (kategorija);
+
+-- Sada query radi bez ALLOW FILTERING
+SELECT naziv, cijena FROM proizvodi
+WHERE kategorija = 'elektronika';
+
+-- Provjeri index
+DESCRIBE INDEX idx_kategorija;
+
+
+
+Materialized View — alternativni pristupni obrazac:
+-- MV koji omogućuje pretragu narudžbi po gradu
+CREATE MATERIALIZED VIEW narudzbe_po_gradu AS
+  SELECT *
+  FROM narudzbe
+  WHERE grad IS NOT NULL
+    AND korisnik_id IS NOT NULL
+    AND created_at IS NOT NULL
+  PRIMARY KEY (grad, korisnik_id, created_at)
+  WITH CLUSTERING ORDER BY (korisnik_id ASC, created_at DESC);
+
+-- Efikasan query po gradu (bez ALLOW FILTERING)
+SELECT * FROM narudzbe_po_gradu
+WHERE grad = 'Zagreb';
+Materialized View automatski održava drugu tablicu s drugačijim primary key-em. Write amplifikacija — svaki INSERT u narudzbe ažurira i narudzbe_po_gradu. Preporučeno za stabilne pristupne obrasce koji se rijetko mijenjaju.
+Agregacije — COUNT, AVG, SUM:
+-- Ukupan broj narudžbi korisnika
+SELECT COUNT(*) AS broj_narudzbi
+FROM narudzbe
+WHERE korisnik_id = 11111111-1111-1111-1111-111111111111;
+
+-- Suma svih narudžbi korisnika
+SELECT SUM(ukupno) AS ukupna_potrosnja
+FROM narudzbe
+WHERE korisnik_id = 11111111-1111-1111-1111-111111111111;
+
+-- Prosječna ocjena za proizvod
+SELECT AVG(ocjena) AS prosjecna_ocjena, COUNT(*) AS broj_recenzija
+FROM recenzije
+WHERE proizvod_id = <uuid-laptopa>;
+
+Korak 6
+Kreiranje indeksa nad statusom narudžbe
+CREATE INDEX idx_status ON narudzbe (status);
+Sada pokreni upit po statusu (primijeti da radimo BEZ ALLOW FILTERING jer indeks sada radi posao u pozadini):
+SELECT * FROM narudzbe WHERE status = 'isporuceno';
+
+
+Kreiranje tablice za pretragu po gradu
+Budući da smo zaobišli problem s verzijom baze, kreiramo tablicu koja će nam služiti za efikasan upit po gradu:
+CREATE TABLE narudzbe_po_gradu (grad text, korisnik_id uuid, created_at timestamp, status text, ukupno decimal, stavke list<text>, PRIMARY KEY (grad, korisnik_id, created_at));
+
+Ubacimo podatak unutra kako bismo imali što filtrirati:
+INSERT INTO narudzbe_po_gradu (grad, korisnik_id, created_at, status, ukupno) VALUES ('Sarajevo', 33333333-3333-3333-3333-333333333333, '2026-05-25 09:05:23.088000+0000', 'isporuceno', 150.00);
+
+Sada testiraj upit po gradu:
+SELECT * FROM narudzbe_po_gradu WHERE grad = 'Sarajevo';
+
+
+Izračun prosječne ocjene (Agregacija)
+izračun prosječne ocjene i broja recenzija za Laptop:
+SELECT AVG(ocjena) AS prosjecna_ocjena, COUNT(*) AS broj_recenzija FROM recenzije WHERE proizvod_id = ccd3a17c-a63f-4dff-aa46-7c4dafe278cd;
+
+
+
+
+
+-----------------------------
+□	kreirati Secondary Index na dostupnost stupcu tablice proizvodi i izvršiti SELECT upit koji koristi taj index (bez ALLOW FILTERING)
+CREATE INDEX idx_dostupnost ON proizvodi (dostupnost);
+SELECT id, naziv, cijena FROM proizvodi WHERE dostupnost = true;
+CREATE TABLE narudzbe_po_statusu (status text, korisnik_id uuid, created_at timestamp, grad text, ukupno decimal, PRIMARY KEY (status, korisnik_id, created_at));
+
+Kreiranje i testiranje tablice narudzbe_po_statusu
+CREATE TABLE narudzbe_po_statusu (status text, korisnik_id uuid, created_at timestamp, grad text, ukupno decimal, PRIMARY KEY (status, korisnik_id, created_at));
+
+INSERT INTO narudzbe_po_statusu (status, korisnik_id, created_at, grad, ukupno) VALUES ('isporuceno', 33333333-3333-3333-3333-333333333333, '2026-05-25 09:05:23.000000+0000', 'Sarajevo', 150.00);
+Sada pokreni provjeru upita po statusu:
+SELECT * FROM narudzbe_po_statusu WHERE status = 'isporuceno';
+
+
+Agregacije (SUM i AVG) za tvog korisnika
+SELECT SUM(ukupno) AS ukupna_potrosnja, AVG(ukupno) AS prosjecni_iznos FROM narudzbe WHERE korisnik_id = 33333333-3333-3333-3333-333333333333;
+
+Korak 7 — Constraints i schema validacija
+-- Zahtijeva da naziv proizvoda uvijek postoji
+ALTER TABLE proizvodi
+ADD CONSTRAINT naziv_nn CHECK (naziv IS NOT NULL);
+
+-- U novijim verzijama Cassandre (4.1+), direktno pri CREATE:
+-- naziv TEXT NOT NULL,
+CHECK constraint na numeričkim vrijednostima:
+-- Osigurava da je cijena uvijek pozitivna
+ALTER TABLE proizvodi
+ADD CONSTRAINT cijena_pozitivna CHECK (cijena > 0);
+
+-- Ocjena mora biti između 1 i 5
+ALTER TABLE recenzije
+ADD CONSTRAINT ocjena_raspon CHECK (ocjena >= 1 AND ocjena <= 5);
+Napomena: CHECK constrainti su dostupni u Apache Cassandri 5.0+. U starijim verzijama validaciju radite na aplikacijskom sloju ili kroz Custom Types.
+Pregled sheme — provjera cijelog keyspace-a:
+-- Opis cijelog keyspace-a
+DESCRIBE KEYSPACE vjezba;
+
+-- Opis specifične tablice s PRIMARY KEY info
+DESCRIBE TABLE narudzbe;
+DESCRIBE TABLE narudzbe_po_gradu;
+
+-- Svi indeksi u keyspace-u
+SELECT * FROM system_schema.indexes
+WHERE keyspace_name = 'vjezba';
+TRUNCATE i DROP — čišćenje podataka:
+-- Briše sve podatke, ali čuva tablicu (brže od DELETE sve particije)
+TRUNCATE TABLE recenzije;
+
+-- Briše tablicu kompletno
+DROP TABLE IF EXISTS recenzije;
+
+-- Briše cijeli keyspace (ne koristiti u produkciji bez backup-a!)
+DROP KEYSPACE IF EXISTS vjezba;
